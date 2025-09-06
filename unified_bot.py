@@ -1,4 +1,4 @@
-# unified_bot.py
+# unified_bot.py (исправленная версия)
 import json
 import re
 import logging
@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Состояния для ConversationHandler
-SELECTING_STORY, SELECTING_SERIES = range(2)
+SELECTING_CATEGORY = range(1)
 
 # Функции для работы с данными
 def load_data():
@@ -19,11 +19,15 @@ def load_data():
         with open('guides_data.json', 'r', encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
-        return {"guides_data.json": {}}
+        return {}
 
 def save_data(data):
     with open('guides_data.json', 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
+
+def build_hierarchy_path(hashtags):
+    """Строит путь в иерархии из хештегов"""
+    return " > ".join(hashtags)
 
 # Обработчик сообщений из канала (админская часть)
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -36,30 +40,41 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     caption = update.channel_post.caption or ""
     hashtags = re.findall(r'#(\w+)', caption)
 
-    if len(hashtags) < 2:
-        await update.channel_post.reply_text("Нужны два хештега: #История #Серия")
+    if len(hashtags) < 1:
+        await update.channel_post.reply_text("Нужен хотя бы один хештег: #Категория")
         return
 
-    story_name, series_name = hashtags[0], hashtags[1]
     file_id = update.channel_post.photo[-1].file_id
-
     data = load_data()
-    
-    if story_name not in data['guides_data.json']:
-        data['guides_data.json'][story_name] = {"series": {}}
-    
-    if series_name not in data['guides_data.json'][story_name]['series']:
-        data['guides_data.json'][story_name]['series'][series_name] = {"photos": []}
-    
-    data['guides_data.json'][story_name]['series'][series_name]["photos"].append(file_id)
+
+    # Строим путь в иерархии
+    current_level = data
+    for i, hashtag in enumerate(hashtags):
+        if hashtag not in current_level:
+            # Если это последний хештег - создаем запись с фото
+            if i == len(hashtags) - 1:
+                current_level[hashtag] = {"photos": [file_id]}
+            else:
+                current_level[hashtag] = {}
+        elif i == len(hashtags) - 1:
+            # Если это последний хештег и запись уже существует
+            if "photos" not in current_level[hashtag]:
+                current_level[hashtag]["photos"] = []
+            current_level[hashtag]["photos"].append(file_id)
+        
+        current_level = current_level[hashtag]
+
     save_data(data)
 
-    await update.channel_post.reply_text(
-        f"✅ Фото добавлено в гайд!\n"
-        f"🎮 Гайд: {story_name}\n"
-        f"📖 Серия: {series_name}\n"
-        f"📸 Фото: {len(data['guides_data.json'][story_name]['series'][series_name]['photos'])}"
+    # Формируем ответное сообщение
+    hierarchy_path = build_hierarchy_path(hashtags)
+    response_text = (
+        f"✅ Фото добавлено!\n"
+        f"📍 Путь: {hierarchy_path}\n"
+        f"📸 Всего фото: {len(current_level['photos']) if 'photos' in current_level else 0}"
     )
+    
+    await update.channel_post.reply_text(response_text)
 
 # Обработчик текстовых сообщений из канала (рассылка)
 async def handle_channel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -69,151 +84,186 @@ async def handle_channel_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if str(update.channel_post.chat.id) != str(config.CHANNEL_ID):
         return
     
-    # Пересылаем сообщение из канала всем пользователям
     try:
         with open('user_data.json', 'r', encoding='utf-8') as f:
             user_data = json.load(f)
     except FileNotFoundError:
-        return  # Если нет пользователей, ничего не делаем
+        return
     
     message_text = update.channel_post.text
     
     for user_id in user_data.get('users', []):
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=message_text
-            )
-            await asyncio.sleep(0.1)  # Небольшая задержка
+            await context.bot.send_message(chat_id=user_id, text=message_text)
+            await asyncio.sleep(0.1)
         except:
-            continue  # Пропускаем если ошибка
+            continue
 
 # Функция для создания клавиатуры с кнопками в 2 колонки
 def create_two_column_keyboard(items):
+    if not items:
+        return []
+        
     keyboard = []
     row = []
     
     for i, item in enumerate(items):
         row.append(KeyboardButton(item))
-        # Каждые 2 кнопки создаем новый ряд
         if (i + 1) % 2 == 0:
             keyboard.append(row)
             row = []
     
-    # Добавляем оставшиеся кнопки
     if row:
         keyboard.append(row)
     
     return keyboard
 
-# Обработчики для пользователей (паблик часть)
+def get_current_level_data(data, current_path):
+    """Получает данные для текущего уровня иерархии"""
+    current_level = data
+    for part in current_path:
+        if part in current_level:
+            current_level = current_level[part]
+        else:
+            return None
+    return current_level
+
+def get_available_choices(current_data):
+    """Получает доступные варианты выбора для текущего уровня"""
+    choices = []
+    
+    # Добавляем подкатегории (ключи, которые не являются 'photos')
+    for key in current_data.keys():
+        if key != 'photos':
+            choices.append(f"📁 {key}")
+    
+    # Добавляем кнопку просмотра фото, если они есть
+    if 'photos' in current_data and current_data['photos']:
+        choices.append("👁️ Просмотреть фото")
+    
+    # Добавляем навигационные кнопки
+    if choices:  # Только если есть что-то кроме навигации
+        choices.append("← Назад")
+        choices.append("🏠 Главное меню")
+    
+    return choices
+
+# Обработчики для пользователей
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверяем что это сообщение от пользователя, а не из канала
     if update.channel_post:
         return
     
     data = load_data()
     
-    if not data['guides_data.json']:
+    if not data:
         await update.message.reply_text('📭 Пока нет гайдов!', reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
     
-    # Создаем клавиатуру с историями (по две кнопки в ряду)
-    story_names = list(data['guides_data.json'].keys())
-    keyboard = create_two_column_keyboard(story_names)
+    # Инициализируем путь пользователя
+    context.user_data['current_path'] = []
     
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    choices = get_available_choices(data)
+    
+    if not choices:
+        await update.message.reply_text('📭 Пока нет гайдов!')
+        return ConversationHandler.END
+    
+    keyboard = create_two_column_keyboard(choices)
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
     await update.message.reply_text(
-        '🎮 Выбери в меню:',
+        '🎮 Главное меню. Выбери категорию:',
         reply_markup=reply_markup
     )
-    return SELECTING_STORY
+    return SELECTING_CATEGORY
 
-async def handle_story_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверяем что это сообщение от пользователя
+async def handle_category_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.channel_post:
-        return SELECTING_STORY
+        return SELECTING_CATEGORY
     
-    story_name = update.message.text
+    user_choice = update.message.text
     data = load_data()
+    current_path = context.user_data.get('current_path', [])
     
-    if story_name not in data['guides_data.json']:
-        await update.message.reply_text("❌ Действие не распознано")
-        return SELECTING_STORY
+    # Получаем текущие данные
+    current_data = get_current_level_data(data, current_path)
+    if current_data is None:
+        await update.message.reply_text("❌ Ошибка: данные не найдены")
+        return await start(update, context)
     
-    context.user_data['selected_story'] = story_name
-    story_data = data['guides_data.json'][story_name]
+    # Обработка специальных команд
+    if user_choice == "← Назад":
+        if current_path:
+            current_path.pop()
+            context.user_data['current_path'] = current_path
     
-    # Создаем клавиатуру с сериями (по две кнопки в ряду)
-    series_buttons = []
-    for series_name in story_data['series']:
-        photo_count = len(story_data['series'][series_name]['photos'])
-        series_buttons.append(f"{series_name} ({photo_count} фото)")
+    elif user_choice == "🏠 Главное меню":
+        context.user_data['current_path'] = []
+        current_path = []
     
-    keyboard = create_two_column_keyboard(series_buttons)
-    keyboard.append([KeyboardButton("← Назад в меню")])
+    elif user_choice == "👁️ Просмотреть фото":
+        # Показываем фото текущего уровня
+        if 'photos' in current_data and current_data['photos']:
+            for i, file_id in enumerate(current_data['photos'], 1):
+                await update.message.reply_photo(
+                    photo=file_id,
+                    caption=f"📸 Фото {i}/{len(current_data['photos'])}\n"
+                           f"📍 {build_hierarchy_path(current_path) if current_path else 'Главное меню'}"
+                )
+        else:
+            await update.message.reply_text("❌ Нет фото в этой категории")
+        # Остаемся на том же уровне
+        return SELECTING_CATEGORY
     
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-    await update.message.reply_text(
-        f"📖 Гайд: {story_name}\nВыбери в меню:",
-        reply_markup=reply_markup
-    )
-    return SELECTING_SERIES
-
-async def handle_series_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверяем что это сообщение от пользователя
-    if update.channel_post:
-        return SELECTING_SERIES
+    elif user_choice.startswith("📁 "):
+        # Переход в подкатегорию
+        category_name = user_choice[2:]  # Убираем эмодзи
+        current_path.append(category_name)
+        context.user_data['current_path'] = current_path
     
-    series_text = update.message.text
-    data = load_data()
+    else:
+        await update.message.reply_text("❌ Неизвестная команда")
+        return SELECTING_CATEGORY
     
-    if series_text == "← Назад в меню":
-        # Возвращаемся к выбору истории
-        story_names = list(data['guides_data.json'].keys())
-        keyboard = create_two_column_keyboard(story_names)
-        
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    # Получаем данные для нового уровня
+    if current_path:
+        current_data = get_current_level_data(data, current_path)
+    else:
+        current_data = data
+    
+    if current_data is None:
+        await update.message.reply_text("❌ Категория не найдена")
+        context.user_data['current_path'] = []
+        current_data = data
+    
+    choices = get_available_choices(current_data)
+    
+    if not choices:
+        await update.message.reply_text("📭 В этой категории пока ничего нет")
+        if current_path:
+            current_path.pop()
+            context.user_data['current_path'] = current_path
+            current_data = get_current_level_data(data, current_path)
+            choices = get_available_choices(current_data)
+        else:
+            choices = get_available_choices(data)
+    
+    keyboard = create_two_column_keyboard(choices)
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    if current_path:
         await update.message.reply_text(
-            '🎮 Выбери в меню:',
+            f"📍 Текущий путь: {build_hierarchy_path(current_path)}\n"
+            f"Выбери действие:",
             reply_markup=reply_markup
         )
-        return SELECTING_STORY
-    
-    # Извлекаем название серии из текста кнопки
-    series_name = series_text.split(' (')[0]  # Убираем " (X фото)"
-    story_name = context.user_data.get('selected_story')
-    
-    if not story_name:
-        await update.message.reply_text("❌ Ошибка: история не выбрана")
-        return SELECTING_STORY
-    
-    if (story_name not in data['guides_data.json'] or 
-        series_name not in data['guides_data.json'][story_name]['series']):
-        await update.message.reply_text("❌ Серия не найдена")
-        return SELECTING_SERIES
-    
-    photos = data['guides_data.json'][story_name]['series'][series_name]['photos']
-    
-    # Отправляем все фото
-    for i, file_id in enumerate(photos, 1):
-        await update.message.reply_photo(
-            photo=file_id,
-            caption=f"🎮 Гайд: {story_name}\n📖 №: {series_name}\n📸 страница: {i}/{len(photos)}"
+    else:
+        await update.message.reply_text(
+            '🎮 Главное меню. Выбери категорию:',
+            reply_markup=reply_markup
         )
     
-    # После отправки фото остаемся в том же меню
-    story_data = data['guides_data.json'][story_name]
-    series_buttons = []
-    for series in story_data['series']:
-        photo_count = len(story_data['series'][series]['photos'])
-        series_buttons.append(f"{series} ({photo_count} фото)")
-    
-    keyboard = create_two_column_keyboard(series_buttons)
-    keyboard.append([KeyboardButton("← Назад к историям")])
-    
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
-    return SELECTING_SERIES
+    return SELECTING_CATEGORY
 
 def main():
     application = Application.builder().token(config.ADMIN_BOT_TOKEN).build()
@@ -230,15 +280,12 @@ def main():
         handle_channel_text
     ))
     
-    # Обработчики для пользователей (паблик) с ConversationHandler
+    # Обработчики для пользователей
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
-            SELECTING_STORY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_story_selection)
-            ],
-            SELECTING_SERIES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_series_selection)
+            SELECTING_CATEGORY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_category_selection)
             ],
         },
         fallbacks=[],
@@ -246,7 +293,7 @@ def main():
     
     application.add_handler(conv_handler)
     
-    print("Бот запущен! Слушает канал и отвечае пользователям!")
+    print("Бот запущен! Слушает канал и отвечает пользователям!")
     application.run_polling()
 
 if __name__ == '__main__':
