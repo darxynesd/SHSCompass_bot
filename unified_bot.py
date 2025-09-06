@@ -132,21 +132,24 @@ def get_available_choices(current_data):
     """Получает доступные варианты выбора для текущего уровня"""
     choices = []
     
-    # Добавляем подкатегории (ключи, которые не являются 'photos')
+    # Добавляем только подкатегории (ключи, которые не являются 'photos')
     for key in current_data.keys():
         if key != 'photos':
             choices.append(f"📁 {key}")
     
-    # Добавляем кнопку просмотра фото, если они есть
-    if 'photos' in current_data and current_data['photos']:
-        choices.append("👁️ Просмотреть фото")
-    
-    # Добавляем навигационные кнопки
-    if choices:  # Только если есть что-то кроме навигации
-        choices.append("← Назад")
-        choices.append("🏠 Главное меню")
-    
     return choices
+
+async def show_photos_if_exist(update, current_data, current_path):
+    """Показывает фото, если они есть в текущей категории"""
+    if 'photos' in current_data and current_data['photos']:
+        for i, file_id in enumerate(current_data['photos'], 1):
+            await update.message.reply_photo(
+                photo=file_id,
+                caption=f"📸 Фото {i}/{len(current_data['photos'])}\n"
+                       f"📍 {build_hierarchy_path(current_path) if current_path else 'Главное меню'}"
+            )
+        return True
+    return False
 
 # Обработчики для пользователей
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,12 +164,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Инициализируем путь пользователя
     context.user_data['current_path'] = []
+    current_path = []
+    
+    # Показываем фото из корневой категории, если они есть
+    await show_photos_if_exist(update, data, current_path)
     
     choices = get_available_choices(data)
     
     if not choices:
         await update.message.reply_text('📭 Пока нет гайдов!')
         return ConversationHandler.END
+    
+    # Добавляем навигационные кнопки только если есть куда возвращаться
+    if current_path:
+        choices.append("← Назад")
+    choices.append("🏠 Главное меню")
     
     keyboard = create_two_column_keyboard(choices)
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -185,12 +197,6 @@ async def handle_category_selection(update: Update, context: ContextTypes.DEFAUL
     data = load_data()
     current_path = context.user_data.get('current_path', [])
     
-    # Получаем текущие данные
-    current_data = get_current_level_data(data, current_path)
-    if current_data is None:
-        await update.message.reply_text("❌ Ошибка: данные не найдены")
-        return await start(update, context)
-    
     # Обработка специальных команд
     if user_choice == "← Назад":
         if current_path:
@@ -200,20 +206,6 @@ async def handle_category_selection(update: Update, context: ContextTypes.DEFAUL
     elif user_choice == "🏠 Главное меню":
         context.user_data['current_path'] = []
         current_path = []
-    
-    elif user_choice == "👁️ Просмотреть фото":
-        # Показываем фото текущего уровня
-        if 'photos' in current_data and current_data['photos']:
-            for i, file_id in enumerate(current_data['photos'], 1):
-                await update.message.reply_photo(
-                    photo=file_id,
-                    caption=f"📸 Фото {i}/{len(current_data['photos'])}\n"
-                           f"📍 {build_hierarchy_path(current_path) if current_path else 'Главное меню'}"
-                )
-        else:
-            await update.message.reply_text("❌ Нет фото в этой категории")
-        # Остаемся на том же уровне
-        return SELECTING_CATEGORY
     
     elif user_choice.startswith("📁 "):
         # Переход в подкатегорию
@@ -227,26 +219,51 @@ async def handle_category_selection(update: Update, context: ContextTypes.DEFAUL
     
     # Получаем данные для нового уровня
     if current_path:
+        parent_path = current_path[:-1]
+        parent_data = get_current_level_data(data, parent_path) if parent_path else data
         current_data = get_current_level_data(data, current_path)
     else:
+        parent_data = data
         current_data = data
     
     if current_data is None:
         await update.message.reply_text("❌ Категория не найдена")
-        context.user_data['current_path'] = []
-        current_data = data
+        # Возвращаемся на уровень выше
+        if current_path:
+            current_path.pop()
+            context.user_data['current_path'] = current_path
+            current_data = get_current_level_data(data, current_path) if current_path else data
+        else:
+            current_data = data
+    
+    # Автоматически показываем фото, если они есть в этой категории
+    has_photos = await show_photos_if_exist(update, current_data, current_path)
+    
+    # ВАЖНОЕ ИЗМЕНЕНИЕ: После показа фото возвращаемся на уровень ВЫШЕ
+    # чтобы можно было выбирать другие категории на том же уровне
+    if has_photos and current_path:
+        # После показа фото возвращаемся к родительскому уровню
+        parent_path = current_path[:-1]
+        context.user_data['current_path'] = parent_path
+        current_path = parent_path
+        current_data = get_current_level_data(data, parent_path) if parent_path else data
     
     choices = get_available_choices(current_data)
     
-    if not choices:
+    if not choices and not has_photos:
         await update.message.reply_text("📭 В этой категории пока ничего нет")
         if current_path:
             current_path.pop()
             context.user_data['current_path'] = current_path
-            current_data = get_current_level_data(data, current_path)
+            current_data = get_current_level_data(data, current_path) if current_path else data
             choices = get_available_choices(current_data)
         else:
             choices = get_available_choices(data)
+    
+    # Добавляем навигационные кнопки
+    if current_path:
+        choices.append("← Назад")
+    choices.append("🏠 Главное меню")
     
     keyboard = create_two_column_keyboard(choices)
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -254,7 +271,7 @@ async def handle_category_selection(update: Update, context: ContextTypes.DEFAUL
     if current_path:
         await update.message.reply_text(
             f"📍 Текущий путь: {build_hierarchy_path(current_path)}\n"
-            f"Выбери действие:",
+            f"Выбери категорию:",
             reply_markup=reply_markup
         )
     else:
