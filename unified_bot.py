@@ -1,4 +1,4 @@
-# unified_bot.py (с мгновенной отправкой)
+# unified
 import json
 import re
 import logging
@@ -379,4 +379,5 @@ def main():
     application.run_polling()
 
 if __name__ == '__main__':
+
     main()
