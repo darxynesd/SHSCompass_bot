@@ -1,4 +1,4 @@
-# unified_bot.py (исправленная версия)
+# unified_bot.py (с мгновенной отправкой)
 import json
 import re
 import logging
@@ -31,50 +31,52 @@ def build_hierarchy_path(hashtags):
 
 # Обработчик сообщений из канала (админская часть)
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.channel_post or not update.channel_post.photo:
+    if not update.channel_post:
         return
 
     if str(update.channel_post.chat.id) != str(config.CHANNEL_ID):
         return
 
-    caption = update.channel_post.caption or ""
-    hashtags = re.findall(r'#(\w+)', caption)
+    # Обработка фото с хештегами
+    if update.channel_post.photo:
+        caption = update.channel_post.caption or ""
+        hashtags = re.findall(r'#(\w+)', caption)
 
-    if len(hashtags) < 1:
-        await update.channel_post.reply_text("Нужен хотя бы один хештег: #Категория")
-        return
+        if len(hashtags) < 1:
+            await update.channel_post.reply_text("Нужен хотя бы один хештег: #Категория")
+            return
 
-    file_id = update.channel_post.photo[-1].file_id
-    data = load_data()
+        file_id = update.channel_post.photo[-1].file_id
+        data = load_data()
 
-    # Строим путь в иерархии
-    current_level = data
-    for i, hashtag in enumerate(hashtags):
-        if hashtag not in current_level:
-            # Если это последний хештег - создаем запись с фото
-            if i == len(hashtags) - 1:
-                current_level[hashtag] = {"photos": [file_id]}
-            else:
-                current_level[hashtag] = {}
-        elif i == len(hashtags) - 1:
-            # Если это последний хештег и запись уже существует
-            if "photos" not in current_level[hashtag]:
-                current_level[hashtag]["photos"] = []
-            current_level[hashtag]["photos"].append(file_id)
+        # Строим путь в иерархии
+        current_level = data
+        for i, hashtag in enumerate(hashtags):
+            if hashtag not in current_level:
+                # Если это последний хештег - создаем запись с фото
+                if i == len(hashtags) - 1:
+                    current_level[hashtag] = {"photos": [file_id]}
+                else:
+                    current_level[hashtag] = {}
+            elif i == len(hashtags) - 1:
+                # Если это последний хештег и запись уже существует
+                if "photos" not in current_level[hashtag]:
+                    current_level[hashtag]["photos"] = []
+                current_level[hashtag]["photos"].append(file_id)
+            
+            current_level = current_level[hashtag]
+
+        save_data(data)
+
+        # Формируем ответное сообщение
+        hierarchy_path = build_hierarchy_path(hashtags)
+        response_text = (
+            f"✅ Фото добавлено!\n"
+            f"📍 Путь: {hierarchy_path}\n"
+            f"📸 Всего фото: {len(current_level['photos']) if 'photos' in current_level else 0}"
+        )
         
-        current_level = current_level[hashtag]
-
-    save_data(data)
-
-    # Формируем ответное сообщение
-    hierarchy_path = build_hierarchy_path(hashtags)
-    response_text = (
-        f"✅ Фото добавлено!\n"
-        f"📍 Путь: {hierarchy_path}\n"
-        f"📸 Всего фото: {len(current_level['photos']) if 'photos' in current_level else 0}"
-    )
-    
-    await update.channel_post.reply_text(response_text)
+        await update.channel_post.reply_text(response_text)
 
 # Обработчик текстовых сообщений из канала (рассылка)
 async def handle_channel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -84,20 +86,70 @@ async def handle_channel_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if str(update.channel_post.chat.id) != str(config.CHANNEL_ID):
         return
     
-    try:
-        with open('user_data.json', 'r', encoding='utf-8') as f:
-            user_data = json.load(f)
-    except FileNotFoundError:
-        return
-    
     message_text = update.channel_post.text
+    caption = update.channel_post.caption or ""
+    text_with_caption = f"{message_text}\n\n{caption}" if caption else message_text
     
-    for user_id in user_data.get('users', []):
+    # Проверяем есть ли хештег #отправьсейчас
+    if "#отправьсейчас" in text_with_caption.lower():
+        # Убираем хештег из сообщения для пользователей
+        clean_message = re.sub(r'#отправьсейчас', '', text_with_caption, flags=re.IGNORECASE).strip()
+        
         try:
-            await context.bot.send_message(chat_id=user_id, text=message_text)
-            await asyncio.sleep(0.1)
-        except:
-            continue
+            with open('user_data.json', 'r', encoding='utf-8') as f:
+                user_data = json.load(f)
+        except FileNotFoundError:
+            await update.channel_post.reply_text("❌ Файл user_data.json не найден")
+            return
+        
+        users = user_data.get('users', [])
+        if not users:
+            await update.channel_post.reply_text("❌ Нет пользователей для рассылки")
+            return
+        
+        success_count = 0
+        fail_count = 0
+        
+        for user_id in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=clean_message
+                )
+                success_count += 1
+                await asyncio.sleep(0.1)  # Небольшая задержка
+            except Exception as e:
+                logger.error(f"Ошибка отправки пользователю {user_id}: {e}")
+                fail_count += 1
+                continue
+        
+        # Отправляем отчет в канал
+        report_text = (
+            f"📢 Мгновенная рассылка завершена!\n"
+            f"✅ Успешно: {success_count}\n"
+            f"❌ Не удалось: {fail_count}\n"
+            f"👥 Всего пользователей: {len(users)}"
+        )
+        
+        await update.channel_post.reply_text(report_text)
+        
+    else:
+        # Обычная рассылка (без мгновенной отправки)
+        try:
+            with open('user_data.json', 'r', encoding='utf-8') as f:
+                user_data = json.load(f)
+        except FileNotFoundError:
+            return
+        
+        for user_id in user_data.get('users', []):
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message_text
+                )
+                await asyncio.sleep(0.1)
+            except:
+                continue
 
 # Функция для создания клавиатуры с кнопками в 2 колонки
 def create_two_column_keyboard(items):
@@ -155,6 +207,19 @@ async def show_photos_if_exist(update, current_data, current_path):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.channel_post:
         return
+    
+    # Добавляем пользователя в базу
+    try:
+        with open('user_data.json', 'r', encoding='utf-8') as f:
+            user_data = json.load(f)
+    except FileNotFoundError:
+        user_data = {"users": []}
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data["users"]:
+        user_data["users"].append(user_id)
+        with open('user_data.json', 'w', encoding='utf-8') as f:
+            json.dump(user_data, f, ensure_ascii=False, indent=4)
     
     data = load_data()
     
@@ -291,7 +356,7 @@ def main():
         handle_channel_post
     ))
 
-    # Обработчик для текста из канала
+    # Обработчик для текста из канала (включая #отправьсейчас)
     application.add_handler(MessageHandler(
         filters.ChatType.CHANNEL & filters.TEXT,
         handle_channel_text
